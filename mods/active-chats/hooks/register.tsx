@@ -129,9 +129,14 @@ export function groupChats(list: readonly Chat[], now: number) {
   }
 }
 
+/** Spells out what the row's color says, so the color is never the only cue. */
+export function rowStatus(chat: Chat): string {
+  return chat.state === 'idle' ? '' : `${LABEL[chat.state]} · `
+}
+
 const LABEL: Record<ChatState, string> = {
-  waiting: 'Waiting for you',
-  working: 'Working',
+  waiting: 'Needs you',
+  working: 'Running',
   idle: 'Idle',
   archived: 'Archived',
 }
@@ -318,7 +323,12 @@ async function refresh($: EngineInterface): Promise<void> {
         }
     }
     await update($, chats, () => next)
-    await Promise.all((await read($, expandedIds)).map(id => loadDetail($, id)))
+    await Promise.all([
+        ...new Set([
+          ...(await read($, expandedIds)),
+          ...next.filter(chat => chat.state === 'working').map(chat => chat.id),
+        ]),
+      ].map(id => loadDetail($, id)))
     await update($, isCapped, () => sessions.length === MAX_CHATS)
     await update($, error, () => null)
   } catch (failure) {
@@ -403,25 +413,6 @@ export const register: Register = on => {
         />
       )
 
-    const tile = (count: number, label: string, color?: string) => (
-      <Box
-        flexDirection="column"
-        flexGrow={1}
-        alignItems="center"
-        padding={1}
-        borderStyle="round"
-        borderColor={color}
-        borderDimColor={!color}
-      >
-        <Text size="title" weight="bold" color={color}>
-          {String(count)}
-        </Text>
-        <Text size="caption" color={color}>
-          {label}
-        </Text>
-      </Box>
-    )
-
     const detailView = (chat: Chat) => {
       const detail = detailById[chat.id]
       if (!detail) return <Text size="caption" dimColor>Loading…</Text>
@@ -477,85 +468,67 @@ export const register: Register = on => {
       )
     }
 
-    const card = (chat: Chat) => {
+    const row = (chat: Chat) => {
       const color = chatColor(chat, now)
+      const isOpen = expanded.includes(chat.id)
+      const runningAgents = (detailById[chat.id]?.agents ?? []).filter(
+        agent => agent.status === 'running',
+      ).length
 
       return (
-        <Box
-          key={`card-${chat.id}`}
-          flexDirection="row"
-          gap={1}
-          padding={1}
-          alignItems="center"
-          borderStyle="round"
-          borderColor={color}
-          borderDimColor={!color}
-        >
-          {character(chat.id, chatPose(chat, now), 48)}
-          <Box flexDirection="column" flexShrink={1}>
-            <Button
-              key={chat.id}
-              plain
-              onPress={async () => {
-                const opened = await $.process.run(['open', chat.link ?? ''])
-                if (opened.exitCode !== 0) {
-                  await $.ui.toast(`Could not open ${chat.title}`)
-                }
-              }}
-            >
-              <Text bold color={color}>
-                {chat.title}
+        <Box key={`row-${chat.id}`} flexDirection="column">
+          <Box flexDirection="row" gap={1} alignItems="center">
+            {character(chat.id, chatPose(chat, now), 28)}
+            <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+              <Button
+                key={chat.id}
+                plain
+                onPress={async () => {
+                  const opened = await $.process.run(['open', chat.link ?? ''])
+                  if (opened.exitCode !== 0) {
+                    await $.ui.toast(`Could not open ${chat.title}`)
+                  }
+                }}
+              >
+                <Text bold color={color}>
+                  {chat.title}
+                </Text>
+              </Button>
+              <Text size="caption" color={color} dimColor={!color}>
+                {rowStatus(chat)}
+                {chatMeta(chat, now)}
+                {runningAgents > 0 ? ` · ${runningAgents} agents` : ''}
               </Text>
-            </Button>
-            <Text weight="semibold" size="caption" color={color}>
-              {LABEL[chat.state]}
-            </Text>
-            <Text size="caption" color={color} dimColor={!color}>
-              {chatMeta(chat, now)}
-            </Text>
-            {(chat.uncommitted || chat.unmerged) ? (
-              <Box flexDirection="row" gap={1}>
-                {chat.uncommitted ? (
-                  <Text size="caption" weight="semibold" color={AMBER}>
-                    ✎ {chat.uncommitted} uncommitted
-                  </Text>
-                ) : null}
-                {chat.unmerged ? (
-                  <Text size="caption" weight="semibold" color={PURPLE}>
-                    ⑂ {chat.unmerged} unmerged
-                  </Text>
-                ) : null}
-              </Box>
-            ) : null}
+              {chat.uncommitted || chat.unmerged ? (
+                <Text size="caption">
+                  {chat.uncommitted ? (
+                    <Text color={AMBER}>{chat.uncommitted} uncommitted </Text>
+                  ) : null}
+                  {chat.unmerged ? (
+                    <Text color={PURPLE}>{chat.unmerged} unmerged</Text>
+                  ) : null}
+                </Text>
+              ) : null}
+            </Box>
             <Button
               key={`expand-${chat.id}`}
+              label={isOpen ? `Hide details for ${chat.title}` : `Show what is running in ${chat.title}`}
               plain
               dimColor
               onPress={async () => {
-                const isOpen = expanded.includes(chat.id)
                 await update($, expandedIds, ids =>
                   isOpen ? ids.filter(id => id !== chat.id) : [...ids, chat.id],
                 )
                 if (!isOpen) await loadDetail($, chat.id)
               }}
             >
-              {expanded.includes(chat.id) ? '▾ Hide details' : '▸ What is running'}
+              <Text>{isOpen ? '▾' : '▸'}</Text>
             </Button>
-            {expanded.includes(chat.id) && detailView(chat)}
           </Box>
+          {isOpen && detailView(chat)}
         </Box>
       )
     }
-
-    const section = (title: string, items: readonly Chat[], color?: string) =>
-      items.length > 0 && (
-        <Box flexDirection="column" gap={1}>
-          <Text weight="semibold" color={color}>
-            {title} ({items.length})
-          </Text>
-          {items.map(card)}
-        </Box>
-      )
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -573,15 +546,13 @@ export const register: Register = on => {
             Refresh
           </Button>
         </Box>
-        <Box flexDirection="row" gap={1}>
-          {tile(groups.needsYou.length, 'Need you', RED)}
-          {tile(groups.running.length, 'Running', GREEN)}
-          {tile(groups.recent.length + groups.older.length, 'Idle')}
-        </Box>
-        <Text size="caption" dimColor>
-          {list.length} listed
-          {capped ? ` from newest ${MAX_CHATS}` : ''}
-          {loading ? ' (updating)' : ''}
+        <Text size="caption">
+          <Text color={RED}>{groups.needsYou.length} need you</Text>
+          {' · '}
+          <Text color={GREEN}>{groups.running.length} running</Text>
+          {` · ${groups.recent.length + groups.older.length} quiet`}
+          {capped ? ` · newest ${MAX_CHATS}` : ''}
+          {loading ? ' · updating' : ''}
         </Text>
         {problem && <Text color="red">Could not load chats: {problem}</Text>}
         {!problem && !loading && list.length === 0 && (
@@ -589,23 +560,23 @@ export const register: Register = on => {
         )}
         {!problem && list.length > 0 && groups.needsYou.length === 0 && (
           <Box flexDirection="row" gap={1} alignItems="center">
-            {character('all-clear', 'allClear', 64)}
-            <Text weight="semibold">All clear. Nothing needs you.</Text>
+            {character('all-clear', 'allClear', 28)}
+            <Text size="caption">All clear. Nothing needs you.</Text>
           </Box>
         )}
-        {section('Needs you', groups.needsYou, RED)}
-        {section('Running', groups.running, GREEN)}
-        {section('Recent', groups.recent)}
+        {[...groups.needsYou, ...groups.running, ...groups.recent].map(row)}
         {groups.older.length > 0 && (
           <Button
             key="toggle-older"
+            plain
+            dimColor
             onPress={() => update($, isOlderOpen, value => !value)}
           >
             {showOlder ? 'Hide older' : `Show older (${groups.older.length})`}
           </Button>
         )}
-        {showOlder && section('Older', groups.older, GREY)}
-        {section('Archived', groups.archived, GREY)}
+        {showOlder && groups.older.map(row)}
+        {groups.archived.map(row)}
       </Box>
     )
   })
