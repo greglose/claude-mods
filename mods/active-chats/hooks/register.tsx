@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, McpToolResult, Register } from 'claude-code'
 
 import type { Chat, ChatDetail, ChatState } from '../types'
-import { DISK_SCRIPT, readDisk, readTranscript } from './details'
+import { DISK_SCRIPT, LIST_SCRIPT, readDisk, readTranscript } from './details'
 import { characterSvg, isAnimated } from './characters'
 import type { Pose } from './characters'
 
@@ -20,9 +20,9 @@ const includeArchived = atom(
 )
 const error = atom({ plugin: 'active-chats', key: 'error' } as const, null)
 const isCapped = atom({ plugin: 'active-chats', key: 'isCapped' } as const, false)
-const isOlderOpen = atom(
-  { plugin: 'active-chats', key: 'isOlderOpen' } as const,
-  false,
+const openProjects = atom(
+  { plugin: 'active-chats', key: 'openProjects' } as const,
+  {},
 )
 const expandedIds = atom(
   { plugin: 'active-chats', key: 'expandedIds' } as const,
@@ -45,8 +45,12 @@ type Listed = {
   prNumber?: number
   prState?: string
   startedBy?: string
+  liveAgents?: number
+  activeOutputs?: number
 }
 
+// Only the end of a message asks; a question earlier on was usually answered.
+const ASK_WINDOW = 300
 const ASKS =
   /\?\s*$|\bneed[s]? (?:one |a |an )?(?:decision|answer|input|approval)\b|\bneed[s]? .{0,40}\bfrom you\b|\byour (?:calls?|decision|go-ahead|approval)\b|\bblocked on you\b/im
 
@@ -60,7 +64,7 @@ export function classify(isRunning: boolean, transcript: string): ChatState {
   if (last?.includes('AskUserQuestion')) return 'waiting'
   if (isRunning) return 'working'
 
-  return last?.startsWith('[assistant]') && ASKS.test(last) ? 'waiting' : 'idle'
+  return last?.startsWith('[assistant]') && ASKS.test(last.slice(-ASK_WINDOW)) ? 'waiting' : 'idle'
 }
 
 export function ago(iso: string, now: number): string {
@@ -93,7 +97,65 @@ export function projectName(cwd: string | undefined): string | undefined {
   return cwd?.split('/.claude/worktrees/')[0]?.split('/').filter(Boolean).at(-1)
 }
 
-export function isOld(chat: Chat, now: number): boolean {
+/** The records cover every chat; the tool's rows add the live running state. */
+export function mergeChats(fromDisk: Listed[], fromTool: Listed[]): Listed[] {
+  if (fromDisk.length === 0) return fromTool
+  const live = new Map(fromTool.map(session => [session.sessionId, session]))
+
+  return fromDisk
+    .map(session => ({ ...session, ...live.get(session.sessionId) }))
+    .sort((a, b) => Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt))
+}
+
+/** A chat outside any repo is its own project; a removed worktree keeps its repo. */
+export function fallbackProject(session: Listed): string | undefined {
+  return session.cwd?.includes('/.claude/worktrees/')
+    ? projectName(session.cwd)
+    : (session.title ?? projectName(session.cwd))
+}
+
+function withoutUndefined<T extends object>(value: T | undefined): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(value ?? {}).filter(([, field]) => field !== undefined),
+  ) as Partial<T>
+}
+
+export type ProjectGroup = {
+  name: string
+  quiet: Chat[]
+  needsYou: number
+  running: number
+  uncommitted: number
+  unmerged: number
+  lastActivityAt: string
+}
+
+export function groupProjects(list: readonly Chat[]): ProjectGroup[] {
+  const byName = new Map<string, Chat[]>()
+  for (const chat of list) {
+    if (chat.state === 'archived') continue
+    const name = chat.project ?? chat.title
+    byName.set(name, [...(byName.get(name) ?? []), chat])
+  }
+  const sum = (chats: Chat[], field: 'uncommitted' | 'unmerged') =>
+    chats.reduce((total, chat) => total + (chat[field] ?? 0), 0)
+
+  return [...byName]
+    .map(([name, chats]) => ({
+      name,
+      quiet: chats.filter(chat => chat.state === 'idle'),
+      needsYou: chats.filter(chat => chat.state === 'waiting').length,
+      running: chats.filter(chat => chat.state === 'working').length,
+      uncommitted: sum(chats, 'uncommitted'),
+      unmerged: sum(chats, 'unmerged'),
+      lastActivityAt: chats
+        .map(chat => chat.lastActivityAt)
+        .reduce((a, b) => (Date.parse(a) > Date.parse(b) ? a : b)),
+    }))
+    .sort((a, b) => Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt))
+}
+
+export function isOld(chat: Pick<Chat, 'lastActivityAt'>, now: number): boolean {
   return now - Date.parse(chat.lastActivityAt) > STALE_MS
 }
 
@@ -195,7 +257,7 @@ async function contextPercent(
 }
 
 const GIT_TTL_MS = 2 * 60 * 1000
-type GitState = { uncommitted: number; unmerged: number }
+type GitState = { uncommitted: number; unmerged: number; project?: string }
 const gitCache = new Map<string, { at: number; state: GitState | undefined }>()
 
 // A squash merge leaves commits ahead of the base, so a merged PR counts as none.
@@ -221,7 +283,9 @@ async function gitState(
       const head = await git('symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD')
       const base = head.exitCode === 0 ? head.stdout.trim() : 'origin/main'
       const ahead = await git('rev-list', '--count', `${base}..HEAD`)
+      const top = await git('rev-parse', '--show-toplevel')
       state = {
+        project: top.exitCode === 0 ? projectName(top.stdout.trim()) : undefined,
         uncommitted: status.stdout.split('\n').filter(Boolean).length,
         unmerged:
           ahead.exitCode === 0 && session.prState !== 'MERGED'
@@ -261,34 +325,73 @@ async function loadDetail($: EngineInterface, id: string): Promise<void> {
   await update($, details, all => ({ ...all, [id]: detail }))
 }
 
+let selfId: string | undefined
+
+async function readSelfId($: EngineInterface): Promise<string | undefined> {
+  const self = await $.mcp.call(SERVER, 'get_session', { session_id: 'self' })
+  const body = text(self)
+  if (self.isError || !body.trimStart().startsWith('{')) return undefined
+
+  return JSON.parse(body).sessionId
+}
+
+async function readAllChats(
+  $: EngineInterface,
+  showArchived: boolean,
+): Promise<Listed[]> {
+  try {
+    const run = await $.process.run([
+      'python3',
+      '-c',
+      LIST_SCRIPT,
+      showArchived ? '1' : '0',
+    ])
+    const rows = run.exitCode === 0 ? JSON.parse(run.stdout) : []
+
+    return Array.isArray(rows) ? rows : []
+  } catch {
+    return []
+  }
+}
+
 async function refresh($: EngineInterface): Promise<void> {
   if (isRefreshing) return
   isRefreshing = true
   await update($, isLoading, () => true)
   try {
+    const showArchived = await read($, includeArchived)
     const listed = await $.mcp.call(SERVER, 'list_sessions', {
-      include_archived: await read($, includeArchived),
+      include_archived: showArchived,
       limit: MAX_CHATS,
     })
     const body = text(listed)
     // A refusal can arrive as plain text without isError set.
-    if (listed.isError || !body.trimStart().startsWith('[')) {
-      throw new Error(body)
-    }
-    const sessions = JSON.parse(body) as Listed[]
+    const isListed = !listed.isError && body.trimStart().startsWith('[')
+    const fromTool = isListed ? (JSON.parse(body) as Listed[]) : []
+    const fromDisk = await readAllChats($, showArchived)
+    if (!isListed && fromDisk.length === 0) throw new Error(body)
+    selfId ??= await readSelfId($)
+    const sessions = mergeChats(fromDisk, fromTool).filter(
+      session => session.sessionId !== selfId,
+    )
+    const isComplete = fromDisk.length > 0
 
     const next: Chat[] = []
     for (let at = 0; at < sessions.length; at += BATCH) {
       const batch = sessions.slice(at, at + BATCH).map(async session => {
-        if (await isScheduled($, session.sessionId)) return null
+        if (!isComplete && (await isScheduled($, session.sessionId))) return null
+        const isActive =
+          session.isRunning ||
+          Boolean(session.liveAgents) ||
+          Boolean(session.activeOutputs)
 
         const chat = {
           id: session.sessionId,
           title: session.title ?? 'Untitled',
           link: session.link,
           lastActivityAt: session.lastActivityAt,
-          project: projectName(session.cwd),
-          ...(await gitState($, session)),
+          project: fallbackProject(session),
+          ...withoutUndefined(await gitState($, session)),
           startedBy: session.startedBy,
           prNumber: session.prNumber,
           prState: session.prState,
@@ -299,7 +402,7 @@ async function refresh($: EngineInterface): Promise<void> {
         if (session.isArchived) return { ...chat, state: 'archived' as const }
 
         const cacheKey = `${session.sessionId}@${session.lastActivityAt}`
-        const cached = session.isRunning ? undefined : stateCache.get(cacheKey)
+        const cached = isActive ? undefined : stateCache.get(cacheKey)
         if (cached) return { ...chat, state: cached }
 
         const events = await $.mcp.call(SERVER, 'list_events', {
@@ -310,11 +413,11 @@ async function refresh($: EngineInterface): Promise<void> {
         // A refusal can arrive as plain text without isError set.
         const isReadable = !events.isError && transcript.startsWith('Session "')
         const state = isReadable
-          ? classify(session.isRunning, transcript)
-          : session.isRunning
+          ? classify(isActive, transcript)
+          : isActive
             ? 'working'
             : 'idle'
-        if (isReadable) stateCache.set(cacheKey, state)
+        if (isReadable && !isActive) stateCache.set(cacheKey, state)
 
         return { ...chat, state }
       })
@@ -329,7 +432,7 @@ async function refresh($: EngineInterface): Promise<void> {
           ...next.filter(chat => chat.state === 'working').map(chat => chat.id),
         ]),
       ].map(id => loadDetail($, id)))
-    await update($, isCapped, () => sessions.length === MAX_CHATS)
+    await update($, isCapped, () => !isComplete && sessions.length === MAX_CHATS)
     await update($, error, () => null)
   } catch (failure) {
     const message = failure instanceof Error ? failure.message : String(failure)
@@ -393,7 +496,7 @@ export const register: Register = on => {
     const Svg = 'Svg' in table ? table.Svg : undefined
     const list = await read($, chats)
     const showArchived = await read($, includeArchived)
-    const showOlder = await read($, isOlderOpen)
+    const projectOverrides = await read($, openProjects)
     const problem = await read($, error)
     const loading = await read($, isLoading)
     const capped = await read($, isCapped)
@@ -467,6 +570,13 @@ export const register: Register = on => {
         </Box>
       )
     }
+
+    const projects = groupProjects(list)
+    const heading = (title: string, count: number, color?: string) => (
+      <Text weight="semibold" color={color}>
+        {title} ({count})
+      </Text>
+    )
 
     const row = (chat: Chat) => {
       const color = chatColor(chat, now)
@@ -551,7 +661,7 @@ export const register: Register = on => {
           <Text color={RED}>{groups.needsYou.length} need you</Text>
           {' · '}
           <Text color={GREEN}>{groups.running.length} running</Text>
-          {` · ${groups.recent.length + groups.older.length} quiet`}
+          {` · ${groups.recent.length + groups.older.length} quiet · ${projects.length} projects`}
           {capped ? ` · newest ${MAX_CHATS}` : ''}
           {loading ? ' · updating' : ''}
         </Text>
@@ -565,18 +675,42 @@ export const register: Register = on => {
             <Text size="caption">All clear. Nothing needs you.</Text>
           </Box>
         )}
-        {[...groups.needsYou, ...groups.running, ...groups.recent].map(row)}
-        {groups.older.length > 0 && (
-          <Button
-            key="toggle-older"
-            plain
-            dimColor
-            onPress={() => update($, isOlderOpen, value => !value)}
-          >
-            {showOlder ? 'Hide older' : `Show older (${groups.older.length})`}
-          </Button>
-        )}
-        {showOlder && groups.older.map(row)}
+        {heading('Needs you', groups.needsYou.length, RED)}
+        {groups.needsYou.map(row)}
+        {heading('Active now', groups.running.length, GREEN)}
+        {groups.running.map(row)}
+        {projects.length > 0 && heading('Projects', projects.length)}
+        {projects.map(project => {
+          const isOpen =
+            projectOverrides[project.name] ?? !isOld({ lastActivityAt: project.lastActivityAt }, now)
+
+          return (
+            <Box key={`project-${project.name}`} flexDirection="column" gap={1}>
+              <Button
+                key={`toggle-project-${project.name}`}
+                plain
+                onPress={() =>
+                  update($, openProjects, all => ({ ...all, [project.name]: !isOpen }))
+                }
+              >
+                <Text bold>
+                  {isOpen ? '▾' : '▸'} {project.name}
+                </Text>
+              </Button>
+              <Text size="caption">
+                {project.needsYou > 0 && <Text color={RED}>{project.needsYou} need you · </Text>}
+                {project.running > 0 && <Text color={GREEN}>{project.running} active · </Text>}
+                {project.uncommitted > 0 && <Text color={AMBER}>{project.uncommitted} uncommitted · </Text>}
+                {project.unmerged > 0 && <Text color={PURPLE}>{project.unmerged} unmerged · </Text>}
+                <Text dimColor>
+                  {project.quiet.length} quiet · {ago(project.lastActivityAt, now)}
+                </Text>
+              </Text>
+              {isOpen && project.quiet.map(row)}
+            </Box>
+          )
+        })}
+        {groups.archived.length > 0 && heading('Archived', groups.archived.length, GREY)}
         {groups.archived.map(row)}
       </Box>
     )

@@ -38,7 +38,7 @@ declare module 'claude-code' {
       isCapped: boolean
       expandedIds: string[]
       details: Record<string, ChatDetail>
-      isOlderOpen: boolean
+      openProjects: Record<string, boolean>
       isLoading: boolean
     }
   }

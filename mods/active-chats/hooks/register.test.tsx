@@ -2,7 +2,16 @@ import { expect, test } from 'claude-code/testing'
 
 import { characterSvg, isAnimated } from './characters'
 import { readDisk, readTranscript } from './details'
-import { chatColor, chatMeta, chatPose, groupChats, projectName } from './register'
+import {
+  chatColor,
+  chatMeta,
+  chatPose,
+  classify,
+  groupChats,
+  groupProjects,
+  mergeChats,
+  projectName,
+} from './register'
 
 declare const setTimeout: (fn: () => void, ms: number) => void
 const settle = () => new Promise<void>(resolve => setTimeout(resolve, 0))
@@ -273,4 +282,45 @@ test('transcript gives recent tools and the last words', () => {
 
   expect(read.recentTools).toEqual(['Bash', 'wrap_up'])
   expect(read.lastSaid).toBe('First line.')
+})
+
+test('projects roll up every chat, and only quiet chats sit inside them', () => {
+  const now = Date.parse('2026-10-31T12:00:00.000Z')
+  const groups = groupProjects([
+    { ...chatAt('waiting', 1, now), id: '1', project: 'P', unmerged: 4 },
+    { ...chatAt('idle', 2, now), id: '2', project: 'P', uncommitted: 3 },
+    { ...chatAt('working', 0, now), id: '3', project: 'Q' },
+    { ...chatAt('archived', 0, now), id: '4', project: 'R' },
+  ])
+
+  expect(groups.map(group => group.name)).toEqual(['Q', 'P'])
+  expect(groups[1]?.needsYou).toBe(1)
+  expect(groups[1]?.quiet.map(chat => chat.id)).toEqual(['2'])
+  expect(groups[1]?.uncommitted).toBe(3)
+  expect(groups[1]?.unmerged).toBe(4)
+})
+
+test('the records list every chat and the tool adds the live state', () => {
+  const row = (sessionId: string, at: string, isRunning = false) => ({
+    sessionId,
+    isArchived: false,
+    isRunning,
+    lastActivityAt: at,
+  })
+  const merged = mergeChats(
+    [row('old', '2026-01-01T00:00:00.000Z'), row('new', '2026-10-01T00:00:00.000Z')],
+    [row('new', '2026-10-31T00:00:00.000Z', true)],
+  )
+
+  expect(merged.map(chat => chat.sessionId)).toEqual(['new', 'old'])
+  expect(merged[0]?.isRunning).toBe(true)
+  expect(mergeChats([], [row('a', '2026-01-01T00:00:00.000Z')]).length).toBe(1)
+})
+
+test('only the end of a message counts as asking', () => {
+  const ask = 'Session "S" (idle)\n[assistant] Which one?\n' + 'Done. '.repeat(100)
+
+  expect(classify(false, ask)).toBe('idle')
+  expect(classify(false, 'Session "S" (idle)\n[assistant] Long work.\nWhich one?')).toBe('waiting')
+  expect(classify(true, 'Session "S" (idle)\n[assistant] Which one?')).toBe('working')
 })

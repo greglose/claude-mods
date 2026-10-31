@@ -87,3 +87,54 @@ export function readTranscript(
     lastSaid: firstLine && firstLine.length > 200 ? `${firstLine.slice(0, 200)}…` : firstLine,
   }
 }
+
+// Every non-scheduled chat from the app's session records, so the list is not
+// limited by the 100 rows the session tools can return in one answer.
+export const LIST_SCRIPT = `
+import glob, json, os, sys, time
+include_archived = sys.argv[1] == '1'
+home = os.path.expanduser('~')
+now = time.time()
+rows = []
+for path in glob.glob(home + '/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json'):
+    try:
+        d = json.load(open(path))
+    except (OSError, ValueError):
+        continue
+    archived = bool(d.get('isArchived'))
+    if d.get('scheduledTaskId') or (archived and not include_archived):
+        continue
+    at = d.get('lastActivityAt') or d.get('createdAt') or 0
+    prs = d.get('prs') or [{}]
+    cli = d.get('cliSessionId') or 'none'
+    live = 0
+    outputs = 0
+    if not archived and now - at / 1000 < 86400:
+        for meta_path in glob.glob(home + '/.claude/projects/*/' + cli + '/subagents/**/*.meta.json', recursive=True):
+            try:
+                log = meta_path[:-len('.meta.json')] + '.jsonl'
+                if not json.load(open(meta_path)).get('finished') and now - os.path.getmtime(log) < 600:
+                    live += 1
+            except (OSError, ValueError):
+                pass
+        for task in glob.glob('/private/tmp/claude-*/*/' + cli + '/tasks/*.output'):
+            try:
+                if now - os.path.getmtime(task) < 300:
+                    outputs += 1
+            except OSError:
+                pass
+    rows.append({
+        'sessionId': d.get('sessionId'),
+        'title': d.get('title'),
+        'cwd': d.get('cwd'),
+        'isArchived': archived,
+        'isRunning': False,
+        'lastActivityAt': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime(at / 1000)),
+        'link': 'claude://claude.ai/epitaxy/' + str(d.get('sessionId')),
+        'prNumber': prs[-1].get('prNumber'),
+        'prState': prs[-1].get('prState') or prs[-1].get('state'),
+        'liveAgents': live,
+        'activeOutputs': outputs,
+    })
+print(json.dumps(rows))
+`
