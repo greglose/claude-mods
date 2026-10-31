@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 import { characterSvg, isAnimated } from './characters'
 import { readDisk, readTranscript } from './details'
@@ -10,6 +10,7 @@ import {
   searchChats,
   groupChats,
   groupProjects,
+  isDormant,
   mergeChats,
   projectName,
 } from './register'
@@ -448,4 +449,68 @@ test('search matches every word across title and project', () => {
   expect(searchChats(list, 'RECEIPT app').map(chat => chat.id)).toEqual(['1'])
   expect(searchChats(list, '  ').length).toBe(2)
   expect(searchChats(list, 'nope').length).toBe(0)
+})
+
+test('dormant means quiet for days with nothing waiting or running', () => {
+  const now = Date.parse('2026-10-31T12:00:00.000Z')
+  const project = {
+    name: 'P',
+    quiet: [],
+    needsYou: 0,
+    running: 0,
+    uncommitted: 0,
+    unmerged: 0,
+    lastActivityAt: new Date(now - 4 * 24 * 3_600_000).toISOString(),
+  }
+
+  expect(isDormant(project, now)).toBe(true)
+  expect(isDormant({ ...project, needsYou: 1 }, now)).toBe(false)
+  expect(isDormant({ ...project, running: 1 }, now)).toBe(false)
+  expect(
+    isDormant({ ...project, lastActivityAt: new Date(now - 3_600_000).toISOString() }, now),
+  ).toBe(false)
+})
+
+const startWithStore = async ($: any, on: any, entries?: Record<string, unknown>) => {
+  if (entries) mock.store(on, entries)
+  on('command.register', () => ({ value: { command: 'active-chats' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
+  on('clock.every', () => ({ value: undefined }))
+  on('ui.panes', () => ({ value: [] }))
+  on('clock.now', () => ({ value: Date.parse('2026-10-31T16:05:00.000Z') }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '' } }))
+  on('mcp.call', (_: unknown, e: { tool: string; args: Record<string, unknown> }) => {
+    if (e.tool === 'list_sessions') return reply([session({})])
+    if (e.tool === 'list_events') return reply('Session "Asks" (idle)\n[assistant] Which one?')
+
+    return reply({})
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+}
+
+test('a collapsed section is saved to the store', async ($, on) => {
+  const saved: unknown[] = []
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', (_, e) => {
+    saved.push(e)
+
+    return { value: undefined }
+  })
+  await startWithStore($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  await ui.press({ key: 'section-needs' })
+  expect(await ui.find({ type: 'Text', text: /^Needs you ·/ })).toBeFalsy()
+  expect(saved).toEqual([{ key: 'openState', value: { 'section:needs': false } }])
+  await ui.unmount()
+})
+
+test('a saved collapse holds in a new chat', async ($, on) => {
+  await startWithStore($, on, { openState: { 'section:needs': false } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  expect(await ui.find({ type: 'Text', text: /1 need you/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^Needs you ·/ })).toBeFalsy()
+  await ui.unmount()
 })

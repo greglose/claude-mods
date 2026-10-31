@@ -177,6 +177,17 @@ export function searchChats(list: readonly Chat[], query: string): Chat[] {
   })
 }
 
+const DORMANT_MS = 3 * 24 * 60 * 60 * 1000
+
+/** Nothing needs you, nothing is moving, and it has been quiet for days. */
+export function isDormant(project: ProjectGroup, now: number): boolean {
+  return (
+    project.needsYou === 0 &&
+    project.running === 0 &&
+    now - Date.parse(project.lastActivityAt) > DORMANT_MS
+  )
+}
+
 export function isOld(chat: Pick<Chat, 'lastActivityAt'>, now: number): boolean {
   return now - Date.parse(chat.lastActivityAt) > STALE_MS
 }
@@ -376,10 +387,41 @@ async function readAllChats(
   }
 }
 
+// $.state lasts one session; the store carries these across chats and restarts.
+const OPEN_STATE_KEY = 'openState'
+const EXPANDED_KEY = 'expandedIds'
+
+async function loadSavedView($: EngineInterface): Promise<void> {
+  try {
+    const open = await $.store.get(OPEN_STATE_KEY)
+    if (open && typeof open === 'object') {
+      await update($, openProjects, () => open as Record<string, boolean>)
+    }
+    const ids = await $.store.get(EXPANDED_KEY)
+    if (Array.isArray(ids)) await update($, expandedIds, () => ids as string[])
+  } catch {
+    // The pane works without saved state; it just starts from the defaults.
+  }
+}
+
+async function saveView($: EngineInterface, key: string, value: unknown): Promise<void> {
+  try {
+    await $.store.set(key, value)
+  } catch {
+    // The choice still holds for this chat.
+  }
+}
+
+async function setOpen($: EngineInterface, key: string, value: boolean): Promise<void> {
+  await update($, openProjects, all => ({ ...all, [key]: value }))
+  await saveView($, OPEN_STATE_KEY, await read($, openProjects))
+}
+
 async function refresh($: EngineInterface): Promise<void> {
   if (isRefreshing) return
   isRefreshing = true
   await update($, isLoading, () => true)
+  await loadSavedView($)
   try {
     const showArchived = await read($, includeArchived)
     const listed = await $.mcp.call(SERVER, 'list_sessions', {
@@ -518,6 +560,7 @@ export const register: Register = on => {
       name: 'active-chats',
       description: 'Show your chats, last activity and which are waiting for you',
     })
+    await loadSavedView($)
     void startPane($)
 
     return next(e)
@@ -617,10 +660,11 @@ export const register: Register = on => {
     }
 
     const projects = groupProjects(list)
+    const liveProjects = projects.filter(project => !isDormant(project, now))
+    const dormantProjects = projects.filter(project => isDormant(project, now))
     const isOpen = (key: string, fallback: boolean) =>
       isSearching || (projectOverrides[key] ?? fallback)
-    const toggle = (key: string, value: boolean) => () =>
-      update($, openProjects, all => ({ ...all, [key]: value }))
+    const toggle = (key: string, value: boolean) => () => setOpen($, key, value)
     const section = (
       key: string,
       title: string,
@@ -701,6 +745,7 @@ export const register: Register = on => {
                 await update($, expandedIds, ids =>
                   isOpen ? ids.filter(id => id !== chat.id) : [...ids, chat.id],
                 )
+                await saveView($, EXPANDED_KEY, await read($, expandedIds))
                 if (!isOpen) await loadDetail($, chat.id)
               }}
             >
@@ -708,6 +753,54 @@ export const register: Register = on => {
             </Button>
           </Box>
           {isOpen && detailView(chat)}
+        </Box>
+      )
+    }
+
+    const projectView = (project: ProjectGroup) => {
+      const open = isOpen(project.name, !isOld(project, now))
+      const showOlder = isOpen(`older:${project.name}`, false)
+      const recent = project.quiet.filter(chat => !isOld(chat, now))
+      const older = project.quiet.filter(chat => isOld(chat, now))
+
+      return (
+        <Box key={`project-${project.name}`} flexDirection="column" gap={1}>
+          <Box flexDirection="column">
+            <Button
+              key={`toggle-project-${project.name}`}
+              plain
+              onPress={toggle(project.name, !open)}
+            >
+              <Text bold>
+                {open ? '▾' : '▸'} {project.name}
+              </Text>
+            </Button>
+            <Box paddingLeft={TITLE_INSET}>
+              <Text size="caption">
+                {project.needsYou > 0 && <Text color={RED}>{project.needsYou} need you · </Text>}
+                {project.running > 0 && <Text color={GREEN}>{project.running} active · </Text>}
+                {project.uncommitted > 0 && <Text color={AMBER}>{project.uncommitted} uncommitted · </Text>}
+                {project.unmerged > 0 && <Text color={PURPLE}>{project.unmerged} unmerged · </Text>}
+                <Text dimColor>{ago(project.lastActivityAt, now)}</Text>
+              </Text>
+            </Box>
+          </Box>
+          {open && (recent.length > 0 || older.length > 0) && (
+            <Box flexDirection="column" gap={1} paddingLeft={2}>
+              {recent.map(chat => row(chat, false))}
+              {older.length > 0 && (
+                <Button
+                  key={`older-${project.name}`}
+                  plain
+                  dimColor
+                  onPress={toggle(`older:${project.name}`, !showOlder)}
+                >
+                  {showOlder ? 'Hide older' : `Show ${older.length} older`}
+                </Button>
+              )}
+              {showOlder && older.map(chat => row(chat, false))}
+            </Box>
+          )}
         </Box>
       )
     }
@@ -760,54 +853,11 @@ export const register: Register = on => {
           groups.needsYou.map(chat => row(chat)), RED)}
         {section('active', 'Active now', groups.running.length, true, () =>
           groups.running.map(chat => row(chat)), GREEN)}
-        {section('projects', 'Projects', projects.length, true, () =>
-          projects.map(project => {
-            const open = isOpen(project.name, !isOld(project, now))
-            const showOlder = isOpen(`older:${project.name}`, false)
-            const recent = project.quiet.filter(chat => !isOld(chat, now))
-            const older = project.quiet.filter(chat => isOld(chat, now))
-
-            return (
-              <Box key={`project-${project.name}`} flexDirection="column" gap={1}>
-                <Box flexDirection="column">
-                  <Button
-                    key={`toggle-project-${project.name}`}
-                    plain
-                    onPress={toggle(project.name, !open)}
-                  >
-                    <Text bold>
-                      {open ? '▾' : '▸'} {project.name}
-                    </Text>
-                  </Button>
-                  <Box paddingLeft={TITLE_INSET}>
-                    <Text size="caption">
-                      {project.needsYou > 0 && <Text color={RED}>{project.needsYou} need you · </Text>}
-                      {project.running > 0 && <Text color={GREEN}>{project.running} active · </Text>}
-                      {project.uncommitted > 0 && <Text color={AMBER}>{project.uncommitted} uncommitted · </Text>}
-                      {project.unmerged > 0 && <Text color={PURPLE}>{project.unmerged} unmerged · </Text>}
-                      <Text dimColor>{ago(project.lastActivityAt, now)}</Text>
-                    </Text>
-                  </Box>
-                </Box>
-                {open && (recent.length > 0 || older.length > 0) && (
-                  <Box flexDirection="column" gap={1} paddingLeft={2}>
-                    {recent.map(chat => row(chat, false))}
-                    {older.length > 0 && (
-                      <Button
-                        key={`older-${project.name}`}
-                        plain
-                        dimColor
-                        onPress={toggle(`older:${project.name}`, !showOlder)}
-                      >
-                        {showOlder ? 'Hide older' : `Show ${older.length} older`}
-                      </Button>
-                    )}
-                    {showOlder && older.map(chat => row(chat, false))}
-                  </Box>
-                )}
-              </Box>
-            )
-          }))}
+        {section('projects', 'Projects', liveProjects.length, true, () =>
+          liveProjects.map(projectView))}
+        {dormantProjects.length > 0 &&
+          section('dormant', 'Dormant projects', dormantProjects.length, false, () =>
+            dormantProjects.map(projectView))}
         {groups.archived.length > 0 &&
           section('archived', 'Archived', groups.archived.length, true, () =>
             groups.archived.map(chat => row(chat)), GREY)}
