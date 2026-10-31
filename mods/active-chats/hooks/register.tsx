@@ -497,7 +497,9 @@ export const register: Register = on => {
               <Text size="caption" color={color} dimColor={!color}>
                 {rowStatus(chat)}
                 {chatMeta(chat, now)}
-                {runningAgents > 0 ? ` · ${runningAgents} agents` : ''}
+                {runningAgents > 0
+                  ? ` · ${runningAgents} agent${runningAgents === 1 ? '' : 's'}`
+                  : ''}
               </Text>
               {chat.uncommitted || chat.unmerged ? (
                 <Text size="caption">
@@ -512,7 +514,6 @@ export const register: Register = on => {
             </Box>
             <Button
               key={`expand-${chat.id}`}
-              label={isOpen ? `Hide details for ${chat.title}` : `Show what is running in ${chat.title}`}
               plain
               dimColor
               onPress={async () => {
