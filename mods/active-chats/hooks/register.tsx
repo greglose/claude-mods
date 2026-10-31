@@ -93,6 +93,9 @@ const GREEN = '#3fb950'
 const GREY = '#b4b4b4'
 // A plain Button insets its label; lines under it line up with this.
 const TITLE_INSET = 1
+// An opaque mid-grey border reads on either theme; only the fill needs alpha.
+const CARD_BORDER = '#4f4f55'
+const CARD_FILL = '#8080801f'
 const STALE_MS = 12 * 60 * 60 * 1000
 
 /** Red needs the person, green is running, light grey is over 12 hours old. */
@@ -691,6 +694,12 @@ export const register: Register = on => {
       )
     }
 
+    // The terminal has no fill to spare, so it keeps a dim border alone.
+    const cardStyle =
+      e.surface === 'terminal'
+        ? { borderDimColor: true }
+        : { borderColor: CARD_BORDER, backgroundColor: CARD_FILL }
+
     const row = (chat: Chat, showProject = true) => {
       const color = chatColor(chat, now)
       const isOpen = expanded.includes(chat.id)
@@ -699,10 +708,17 @@ export const register: Register = on => {
       ).length
 
       return (
-        <Box key={`row-${chat.id}`} flexDirection="column">
+        <Box
+          key={`row-${chat.id}`}
+          flexDirection="column"
+          paddingX="sm"
+          paddingY="xs"
+          borderStyle="round"
+          {...cardStyle}
+        >
           <Box flexDirection="row" gap={1} alignItems="center">
             {character(chat.id, chatPose(chat, now), 28)}
-            <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+            <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
               <Button
                 key={chat.id}
                 plain
@@ -824,7 +840,6 @@ export const register: Register = on => {
         {Input && (
           <Input
             key="search"
-            label="Search chats"
             placeholder="Search chats and projects"
             value={query}
             onInput={(value: string) => update($, searchQuery, () => value)}
