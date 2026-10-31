@@ -467,16 +467,36 @@ async function refresh($: EngineInterface): Promise<void> {
 
 // Scheduled runs and hosts without the session server never open the pane by
 // themselves; /active-chats still does.
-async function startPane($: EngineInterface): Promise<void> {
+// The session tools can connect after session.start, so the lookup waits for them.
+const START_RETRY_MS = 2_000
+const START_ATTEMPTS = 30
+
+async function isScheduledChat($: EngineInterface): Promise<boolean | undefined> {
   try {
     const self = await $.mcp.call(SERVER, 'get_session', { session_id: 'self' })
     const body = text(self)
-    if (self.isError || !body.trimStart().startsWith('{')) return
-    if (JSON.parse(body).scheduledTaskId) return
+    if (self.isError || !body.trimStart().startsWith('{')) return undefined
+
+    return Boolean(JSON.parse(body).scheduledTaskId)
   } catch {
+    return undefined
+  }
+}
+
+async function startPane($: EngineInterface, attempt = 1): Promise<void> {
+  const isScheduled = await isScheduledChat($)
+  if (isScheduled === undefined) {
+    if (attempt < START_ATTEMPTS) {
+      $.clock.after(START_RETRY_MS, () => void startPane($, attempt + 1))
+    }
+
     return
   }
-  await $.ui.open({ id: PANE, title: 'Active chats' })
+  if (isScheduled) return
+  const opened = await $.ui.open({ id: PANE, title: 'Active chats' })
+  if (!opened.isPlaced && !opened.reason.startsWith('no-surface')) {
+    $.ui.log(`Active chats pane not shown: ${opened.reason}`)
+  }
   void refresh($)
   startPolling($)
 }

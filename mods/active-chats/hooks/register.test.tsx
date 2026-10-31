@@ -165,6 +165,7 @@ test('a plain-text refusal shows its own words', async ($, on) => {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.every', () => ({ value: undefined }))
   on('ui.panes', () => ({ value: [] }))
+  on('clock.after', () => ({ value: undefined }))
   on('clock.now', () => ({ value: 0 }))
   on('mcp.call', () => reply('Error: result exceeds maximum allowed tokens'))
 
@@ -225,6 +226,106 @@ test('a person\'s chat opens the pane, whatever isInteractive says', async ($, o
   await $.session.start({ cwd: '/', surface: null, isInteractive: false })
   await settle()
   expect(opens).toBe(1)
+})
+
+const flush = async () => {
+  for (let i = 0; i < 50; i += 1) await settle()
+}
+
+test('the pane opens once the session tools are ready', async ($, on) => {
+  let opens = 0
+  let lookups = 0
+  let lookupsAtOpen = 0
+  on('command.register', () => ({ value: { command: 'active-chats' } }))
+  on('ui.open', () => {
+    opens += 1
+    lookupsAtOpen = lookups
+
+    return { value: { isPlaced: true } }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.after', () => ({ value: undefined }))
+  on('mcp.call', (_, e) => {
+    if (e.tool !== 'get_session') return reply([])
+    lookups += 1
+    if (lookups < 3) throw new Error('no tool "get_session"')
+
+    return reply({})
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await flush()
+  expect(lookupsAtOpen).toBe(3)
+  expect(opens).toBe(1)
+})
+
+test('a scheduled chat stays closed when its tools arrive late', async ($, on) => {
+  let opens = 0
+  let lookups = 0
+  on('command.register', () => ({ value: { command: 'active-chats' } }))
+  on('ui.open', () => {
+    opens += 1
+
+    return { value: { isPlaced: true } }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.after', () => ({ value: undefined }))
+  on('mcp.call', () => {
+    lookups += 1
+    if (lookups < 2) throw new Error('no tool "get_session"')
+
+    return reply({ scheduledTaskId: 'nightly' })
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await flush()
+  expect(lookups).toBe(2)
+  expect(opens).toBe(0)
+})
+
+test('the lookup stops retrying when the tools never arrive', async ($, on) => {
+  let opens = 0
+  let lookups = 0
+  on('command.register', () => ({ value: { command: 'active-chats' } }))
+  on('ui.open', () => {
+    opens += 1
+
+    return { value: { isPlaced: true } }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.after', () => ({ value: undefined }))
+  on('mcp.call', () => {
+    lookups += 1
+    throw new Error('no tool "get_session"')
+  })
+
+  await $.session.start({ cwd: '/', surface: null, isInteractive: false })
+  await flush()
+  expect(lookups).toBe(30)
+  expect(opens).toBe(0)
+})
+
+test('a pane left undrawn says why', async ($, on) => {
+  const logged: string[] = []
+  on('command.register', () => ({ value: { command: 'active-chats' } }))
+  on('ui.open', () => ({
+    value: { isPlaced: false, reason: 'unasked panes need 144 columns; 100 now' },
+  }))
+  on('ui.log', (_, e) => {
+    logged.push(e.text)
+
+    return { value: undefined }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 0 }))
+  on('mcp.call', (_, e) => reply(e.tool === 'get_session' ? {} : []))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await flush()
+  expect(logged.join()).toContain('144 columns')
 })
 
 const chatAt = (state: 'waiting' | 'working' | 'idle' | 'archived', hours: number, now: number) => ({
