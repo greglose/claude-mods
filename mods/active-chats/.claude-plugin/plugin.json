@@ -1,0 +1,6 @@
+{
+  "name": "active-chats",
+  "version": "0.1.0",
+  "description": "Pane listing your chats, their last activity and whether each is waiting for you",
+  "types": "./types/index.d.ts"
+}
