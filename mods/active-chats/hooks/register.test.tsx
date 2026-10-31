@@ -7,6 +7,7 @@ import {
   chatMeta,
   chatPose,
   classify,
+  searchChats,
   groupChats,
   groupProjects,
   mergeChats,
@@ -142,6 +143,16 @@ test('active chats show state, and the toggle asks for archived', async ($, on) 
   expect(await ui.find({ type: 'Text', text: /impl-1: Wire it/ })).toBeTruthy()
   await ui.press({ key: 'expand-c' })
   expect(await ui.find({ type: 'Text', text: /impl-1/ })).toBeFalsy()
+  await ui.input({ key: 'search', text: 'flaky-none', kind: 'change' })
+  expect(await ui.find({ type: 'Text', text: /No chats match/ })).toBeTruthy()
+  await ui.input({ key: 'search', text: 'BUSY', kind: 'change' })
+  expect(await ui.find({ type: 'Text', text: /^Running ·/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^Needs you ·/ })).toBeFalsy()
+  await ui.input({ key: 'search', text: '', kind: 'change' })
+  await ui.press({ key: 'section-needs' })
+  expect(await ui.find({ type: 'Text', text: /^Needs you ·/ })).toBeFalsy()
+  await ui.press({ key: 'section-needs' })
+  expect(await ui.find({ type: 'Text', text: /^Needs you ·/ })).toBeTruthy()
   await ui.press({ key: 'toggle-archived' })
   expect(archivedFlags.at(-1)).toBe(true)
   expect(await ui.find({ type: 'Text', text: /^Archived ·/ })).toBeTruthy()
@@ -253,6 +264,7 @@ test('meta line names the project, PR and context', () => {
       now,
     ),
   ).toBe('1h ago · P · PR #7 open · 23% context')
+  expect(chatMeta({ ...chatAt('idle', 1, now), project: 'P' }, now, false)).toBe('1h ago')
 })
 
 test('agents split into running, stalled and done', () => {
@@ -323,4 +335,16 @@ test('only the end of a message counts as asking', () => {
   expect(classify(false, ask)).toBe('idle')
   expect(classify(false, 'Session "S" (idle)\n[assistant] Long work.\nWhich one?')).toBe('waiting')
   expect(classify(true, 'Session "S" (idle)\n[assistant] Which one?')).toBe('working')
+})
+
+test('search matches every word across title and project', () => {
+  const now = Date.parse('2026-10-31T12:00:00.000Z')
+  const list = [
+    { ...chatAt('idle', 1, now), id: '1', title: 'Receipt tracker', project: 'App' },
+    { ...chatAt('idle', 1, now), id: '2', title: 'Other', project: 'Web' },
+  ]
+
+  expect(searchChats(list, 'RECEIPT app').map(chat => chat.id)).toEqual(['1'])
+  expect(searchChats(list, '  ').length).toBe(2)
+  expect(searchChats(list, 'nope').length).toBe(0)
 })

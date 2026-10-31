@@ -1,5 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, McpToolResult, Register } from 'claude-code'
+import type {
+  EngineInterface,
+  McpToolResult,
+  Register,
+  RenderChildren,
+} from 'claude-code'
 
 import type { Chat, ChatDetail, ChatState } from '../types'
 import { DISK_SCRIPT, LIST_SCRIPT, readDisk, readTranscript } from './details'
@@ -20,6 +25,10 @@ const includeArchived = atom(
 )
 const error = atom({ plugin: 'active-chats', key: 'error' } as const, null)
 const isCapped = atom({ plugin: 'active-chats', key: 'isCapped' } as const, false)
+const searchQuery = atom(
+  { plugin: 'active-chats', key: 'searchQuery' } as const,
+  '',
+)
 const openProjects = atom(
   { plugin: 'active-chats', key: 'openProjects' } as const,
   {},
@@ -82,6 +91,8 @@ const AMBER = '#d29922'
 const PURPLE = '#a371f7'
 const GREEN = '#3fb950'
 const GREY = '#b4b4b4'
+// A plain Button insets its label; lines under it line up with this.
+const TITLE_INSET = 1
 const STALE_MS = 12 * 60 * 60 * 1000
 
 /** Red needs the person, green is running, light grey is over 12 hours old. */
@@ -155,6 +166,17 @@ export function groupProjects(list: readonly Chat[]): ProjectGroup[] {
     .sort((a, b) => Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt))
 }
 
+/** Every word must appear somewhere in the chat's title or project. */
+export function searchChats(list: readonly Chat[], query: string): Chat[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+
+  return list.filter(chat => {
+    const haystack = `${chat.title} ${chat.project ?? ''}`.toLowerCase()
+
+    return words.every(word => haystack.includes(word))
+  })
+}
+
 export function isOld(chat: Pick<Chat, 'lastActivityAt'>, now: number): boolean {
   return now - Date.parse(chat.lastActivityAt) > STALE_MS
 }
@@ -165,10 +187,10 @@ export function chatPose(chat: Chat, now: number): Pose {
   return chat.state
 }
 
-export function chatMeta(chat: Chat, now: number): string {
+export function chatMeta(chat: Chat, now: number, showProject = true): string {
   return [
     ago(chat.lastActivityAt, now),
-    chat.project,
+    showProject ? chat.project : undefined,
     chat.prNumber === undefined
       ? undefined
       : `PR #${chat.prNumber}${chat.prState ? ` ${chat.prState.toLowerCase()}` : ''}`,
@@ -393,8 +415,8 @@ async function refresh($: EngineInterface): Promise<void> {
           project: fallbackProject(session),
           ...withoutUndefined(await gitState($, session)),
           startedBy: session.startedBy,
-          prNumber: session.prNumber,
-          prState: session.prState,
+          prNumber: session.prNumber ?? undefined,
+          prState: session.prState ?? undefined,
           contextPercent: session.isArchived
             ? undefined
             : await contextPercent($, session),
@@ -492,9 +514,12 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const table = $.ui.resolve(e)
     const { Box, Button, Text } = table
+    const Input = 'Input' in table ? table.Input : undefined
     // The terminal has no vector element; its cards go without characters.
     const Svg = 'Svg' in table ? table.Svg : undefined
-    const list = await read($, chats)
+    const query = await read($, searchQuery)
+    const list = searchChats(await read($, chats), query)
+    const isSearching = query.trim().length > 0
     const showArchived = await read($, includeArchived)
     const projectOverrides = await read($, openProjects)
     const problem = await read($, error)
@@ -572,13 +597,37 @@ export const register: Register = on => {
     }
 
     const projects = groupProjects(list)
-    const heading = (title: string, count: number, color?: string) => (
-      <Text weight="semibold" color={color}>
-        {title} ({count})
-      </Text>
-    )
+    const isOpen = (key: string, fallback: boolean) =>
+      isSearching || (projectOverrides[key] ?? fallback)
+    const toggle = (key: string, value: boolean) => () =>
+      update($, openProjects, all => ({ ...all, [key]: value }))
+    const section = (
+      key: string,
+      title: string,
+      count: number,
+      fallback: boolean,
+      body: () => RenderChildren,
+      color?: string,
+    ) => {
+      const open = isOpen(`section:${key}`, fallback)
 
-    const row = (chat: Chat) => {
+      return (
+        <Box key={`section-${key}`} flexDirection="column" gap={1} marginTop={1}>
+          <Button
+            key={`section-${key}`}
+            plain
+            onPress={toggle(`section:${key}`, !open)}
+          >
+            <Text weight="semibold" color={color}>
+              {open ? '▾' : '▸'} {title} ({count})
+            </Text>
+          </Button>
+          {open && body()}
+        </Box>
+      )
+    }
+
+    const row = (chat: Chat, showProject = true) => {
       const color = chatColor(chat, now)
       const isOpen = expanded.includes(chat.id)
       const runningAgents = (detailById[chat.id]?.agents ?? []).filter(
@@ -604,9 +653,10 @@ export const register: Register = on => {
                   {chat.title}
                 </Text>
               </Button>
+              <Box flexDirection="column" paddingLeft={TITLE_INSET}>
               <Text size="caption" color={color} dimColor={!color}>
                 {rowStatus(chat)}
-                {chatMeta(chat, now)}
+                {chatMeta(chat, now, showProject)}
                 {runningAgents > 0
                   ? ` · ${runningAgents} agent${runningAgents === 1 ? '' : 's'}`
                   : ''}
@@ -621,6 +671,7 @@ export const register: Register = on => {
                   ) : null}
                 </Text>
               ) : null}
+              </Box>
             </Box>
             <Button
               key={`expand-${chat.id}`}
@@ -657,6 +708,16 @@ export const register: Register = on => {
             Refresh
           </Button>
         </Box>
+        {Input && (
+          <Input
+            key="search"
+            label="Search chats"
+            placeholder="Search chats and projects"
+            value={query}
+            onInput={(value: string) => update($, searchQuery, () => value)}
+            onSubmit={(value: string) => update($, searchQuery, () => value)}
+          />
+        )}
         <Text size="caption">
           <Text color={RED}>{groups.needsYou.length} need you</Text>
           {' · '}
@@ -667,51 +728,69 @@ export const register: Register = on => {
         </Text>
         {problem && <Text color="red">Could not load chats: {problem}</Text>}
         {!problem && !loading && list.length === 0 && (
-          <Text dimColor>No chats.</Text>
+          <Text dimColor>{isSearching ? `No chats match "${query}".` : 'No chats.'}</Text>
         )}
-        {!problem && list.length > 0 && groups.needsYou.length === 0 && (
+        {!problem && !isSearching && list.length > 0 && groups.needsYou.length === 0 && (
           <Box flexDirection="row" gap={1} alignItems="center">
             {character('all-clear', 'allClear', 28)}
             <Text size="caption">All clear. Nothing needs you.</Text>
           </Box>
         )}
-        {heading('Needs you', groups.needsYou.length, RED)}
-        {groups.needsYou.map(row)}
-        {heading('Active now', groups.running.length, GREEN)}
-        {groups.running.map(row)}
-        {projects.length > 0 && heading('Projects', projects.length)}
-        {projects.map(project => {
-          const isOpen =
-            projectOverrides[project.name] ?? !isOld({ lastActivityAt: project.lastActivityAt }, now)
+        {section('needs', 'Needs you', groups.needsYou.length, true, () =>
+          groups.needsYou.map(chat => row(chat)), RED)}
+        {section('active', 'Active now', groups.running.length, true, () =>
+          groups.running.map(chat => row(chat)), GREEN)}
+        {section('projects', 'Projects', projects.length, true, () =>
+          projects.map(project => {
+            const open = isOpen(project.name, !isOld(project, now))
+            const showOlder = isOpen(`older:${project.name}`, false)
+            const recent = project.quiet.filter(chat => !isOld(chat, now))
+            const older = project.quiet.filter(chat => isOld(chat, now))
 
-          return (
-            <Box key={`project-${project.name}`} flexDirection="column" gap={1}>
-              <Button
-                key={`toggle-project-${project.name}`}
-                plain
-                onPress={() =>
-                  update($, openProjects, all => ({ ...all, [project.name]: !isOpen }))
-                }
-              >
-                <Text bold>
-                  {isOpen ? '▾' : '▸'} {project.name}
-                </Text>
-              </Button>
-              <Text size="caption">
-                {project.needsYou > 0 && <Text color={RED}>{project.needsYou} need you · </Text>}
-                {project.running > 0 && <Text color={GREEN}>{project.running} active · </Text>}
-                {project.uncommitted > 0 && <Text color={AMBER}>{project.uncommitted} uncommitted · </Text>}
-                {project.unmerged > 0 && <Text color={PURPLE}>{project.unmerged} unmerged · </Text>}
-                <Text dimColor>
-                  {project.quiet.length} quiet · {ago(project.lastActivityAt, now)}
-                </Text>
-              </Text>
-              {isOpen && project.quiet.map(row)}
-            </Box>
-          )
-        })}
-        {groups.archived.length > 0 && heading('Archived', groups.archived.length, GREY)}
-        {groups.archived.map(row)}
+            return (
+              <Box key={`project-${project.name}`} flexDirection="column" gap={1}>
+                <Box flexDirection="column">
+                  <Button
+                    key={`toggle-project-${project.name}`}
+                    plain
+                    onPress={toggle(project.name, !open)}
+                  >
+                    <Text bold>
+                      {open ? '▾' : '▸'} {project.name}
+                    </Text>
+                  </Button>
+                  <Box paddingLeft={TITLE_INSET}>
+                    <Text size="caption">
+                      {project.needsYou > 0 && <Text color={RED}>{project.needsYou} need you · </Text>}
+                      {project.running > 0 && <Text color={GREEN}>{project.running} active · </Text>}
+                      {project.uncommitted > 0 && <Text color={AMBER}>{project.uncommitted} uncommitted · </Text>}
+                      {project.unmerged > 0 && <Text color={PURPLE}>{project.unmerged} unmerged · </Text>}
+                      <Text dimColor>{ago(project.lastActivityAt, now)}</Text>
+                    </Text>
+                  </Box>
+                </Box>
+                {open && (recent.length > 0 || older.length > 0) && (
+                  <Box flexDirection="column" gap={1} paddingLeft={2}>
+                    {recent.map(chat => row(chat, false))}
+                    {older.length > 0 && (
+                      <Button
+                        key={`older-${project.name}`}
+                        plain
+                        dimColor
+                        onPress={toggle(`older:${project.name}`, !showOlder)}
+                      >
+                        {showOlder ? 'Hide older' : `Show ${older.length} older`}
+                      </Button>
+                    )}
+                    {showOlder && older.map(chat => row(chat, false))}
+                  </Box>
+                )}
+              </Box>
+            )
+          }))}
+        {groups.archived.length > 0 &&
+          section('archived', 'Archived', groups.archived.length, true, () =>
+            groups.archived.map(chat => row(chat)), GREY)}
       </Box>
     )
   })

@@ -12,7 +12,7 @@ A pane beside the chat that lists your Claude Code desktop chats:
 - An expandable "What is running" section showing agents and recent tools.
 - An animated character for each chat.
 
-Scheduled chats are hidden. A toggle adds archived chats.
+Sections and projects collapse, and a search box filters by chat title or project. Scheduled chats are hidden. A toggle adds archived chats.
 
 ### Install
 

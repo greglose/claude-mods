@@ -36,6 +36,7 @@ declare module 'claude-code' {
       includeArchived: boolean
       error: string | null
       isCapped: boolean
+      searchQuery: string
       expandedIds: string[]
       details: Record<string, ChatDetail>
       openProjects: Record<string, boolean>
